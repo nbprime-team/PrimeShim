@@ -22,3 +22,9 @@ android/keystore/
 android/keystore.properties
 
 apk-*/
+
+# local emulator scratch (firmware-derived images, captures)
+/a*.img
+/fb.raw
+/sdlv
+/shim*.png

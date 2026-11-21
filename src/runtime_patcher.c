@@ -1060,6 +1060,48 @@ static bool decode_context_sdt(uint32_t instruction, const ucontext_t *context,
     return true;
 }
 
+
+static uint32_t *trampoline_near(uint32_t source) {
+    static uint32_t *pool;
+    static size_t used;
+    const size_t words = 16;
+    const size_t bytes = 64u * 1024u;
+    static const long offsets[] = {
+        0x01000000L, 0x01400000L, 0x01800000L, 0x01c00000L,
+        0x02000000L, 0x02400000L, 0x00c00000L, 0x00800000L,
+    };
+    size_t i;
+
+    if (pool) {
+        long long delta = (long long)(uintptr_t)pool - (long long)source;
+        if (delta < 0x01e00000LL && delta > -0x01e00000LL &&
+            used * words * 4u + words * 4u <= bytes) {
+            return pool + used++ * words;
+        }
+    }
+    for (i = 0; i < sizeof(offsets) / sizeof(offsets[0]); ++i) {
+        uintptr_t want = ((uintptr_t)((long long)source + offsets[i])) &
+                         ~(uintptr_t)0xfffu;
+        void *mapped = mmap((void *)want, bytes,
+                            PROT_READ | PROT_WRITE | PROT_EXEC,
+                            MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (mapped == MAP_FAILED) {
+            continue;
+        }
+        {
+            long long delta = (long long)(uintptr_t)mapped - (long long)source;
+            if (delta >= 0x01e00000LL || delta <= -0x01e00000LL) {
+                munmap(mapped, bytes);
+                continue;
+            }
+        }
+        pool = mapped;
+        used = 1;
+        return pool;
+    }
+    return NULL;
+}
+
 static pending_patch_t *reserve_patch(runtime_patcher_t *patcher,
                                       uint32_t **trampoline) {
     size_t index = __sync_fetch_and_add(&patcher->patch_count, 1u);
@@ -1090,18 +1132,51 @@ static bool patch_caught_syscall(runtime_patcher_t *patcher, uint32_t source,
     }
     binding_index = find_syscall(patcher, instruction & 0x00ffffffu);
     if (binding_index < 0) {
+        PS_LOG_WARN("runtime", "unregistered SVC 0x%06x at 0x%08x",
+                    instruction & 0x00ffffffu, source);
         return false;
     }
     patch = reserve_patch(patcher, &trampoline);
     if (!patch) {
+        PS_LOG_WARN("runtime", "no patch slot for SVC at 0x%08x", source);
         return false;
+    }
+    {
+        long long delta = (long long)(uintptr_t)trampoline - (long long)source;
+        if (delta > 0x01ffffffLL || delta < -0x01ffffffLL) {
+            uint32_t *near = trampoline_near(source);
+            if (!near) {
+                PS_LOG_WARN("runtime", "no near trampoline for 0x%08x", source);
+                return false;
+            }
+            trampoline = near;
+        }
     }
     memset(patch, 0, sizeof(*patch));
     patch->kind = PATCH_SYSCALL;
     patch->source = source;
     patch->original = instruction;
     patch->binding_index = (size_t)binding_index;
+    {
+        /* Heap-loaded code patches on demand, one call site at a time, so this
+         * is where the interesting bindings show up.  One line per site is
+         * only useful while a port is being brought up. */
+        static int trace = -1;
+        if (trace < 0) {
+            const char *v = getenv("PRIMESHIM_TRACE_HEAP");
+            trace = v && *v && v[0] != '0' && v[0] != 'n' && v[0] != 'N';
+        }
+        if (trace) {
+            PS_LOG_INFO("runtime", "heap SVC 0x%06x -> %s at 0x%08x",
+                        instruction & 0x00ffffffu,
+                        patcher->syscalls[binding_index].name ?
+                            patcher->syscalls[binding_index].name : "?",
+                        source);
+        }
+    }
+
     if (emit_syscall_trampoline(patcher, patch, trampoline) != 0) {
+        PS_LOG_WARN("runtime", "emit failed for SVC at 0x%08x", source);
         return false;
     }
 
@@ -1278,18 +1353,28 @@ static bool make_heap_page_executable(siginfo_t *information,
     page = sysconf(_SC_PAGESIZE);
     if (page <= 0) return false;
     start = fault & ~((uintptr_t)page - 1u);
-    (void)start;
-    /* Do NOT mprotect this page executable.  Heap code is not covered by the
-     * firmware SVC patch (and is far outside the trampoline branch range), so
-     * its BESTA SVCs would become raw Linux syscalls.  That lets arbitrary
-     * native code corrupt the app/ART and has hung/rebooted devices.  Keep the
-     * guest crash contained instead; a sandboxed guest process is required to
-     * run heap-loaded code safely. */
-    PS_LOG_WARN("runtime",
-                "blocked execution of guest heap page 0x%08lx at pc=0x%08lx "
-                "(unsafe in-process; use an isolated guest)",
-                (unsigned long)start, (unsigned long)pc);
-    return false;
+
+    /* Heap-LOADED code: the shellcode loaders (MicroPython on the calculator)
+     * copy the image into a block they just calloc'd and jump into it, so the
+     * first instruction fetch faults on a page that is writable but not
+     * executable.  This used to be refused outright -- the reasoning being
+     * that heap SVCs are outside the firmware patch and would become raw Linux
+     * syscalls -- which meant every such application died on the spot.
+     *
+     * It is permitted now because that objection is answered: the near
+     * trampoline pool (trampoline_near) puts a rewrite within B range of the
+     * heap, and patch_caught_syscall rewrites each SVC the moment it faults,
+     * so heap code reaches the same handlers the firmware does. */
+    if (mprotect((void *)start, (size_t)page,
+                 PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
+        PS_LOG_ERROR("runtime",
+                     "cannot make guest heap page 0x%08lx executable: %s",
+                     (unsigned long)start, strerror(errno));
+        return false;
+    }
+    PS_LOG_INFO("runtime", "guest heap page 0x%08lx is now executable",
+                (unsigned long)start);
+    return true;
 }
 
 static bool patch_faulting_peripheral(runtime_patcher_t *patcher,
@@ -1324,13 +1409,26 @@ static bool patch_faulting_peripheral(runtime_patcher_t *patcher,
     }
     patch = reserve_patch(patcher, &trampoline);
     if (!patch) {
+        PS_LOG_WARN("runtime", "no patch slot for SVC at 0x%08x", source);
         return false;
+    }
+    {
+        long long delta = (long long)(uintptr_t)trampoline - (long long)source;
+        if (delta > 0x01ffffffLL || delta < -0x01ffffffLL) {
+            uint32_t *near = trampoline_near(source);
+            if (!near) {
+                PS_LOG_WARN("runtime", "no near trampoline for 0x%08x", source);
+                return false;
+            }
+            trampoline = near;
+        }
     }
     memset(patch, 0, sizeof(*patch));
     patch->kind = PATCH_PERIPHERAL;
     patch->source = source;
     patch->original = instruction;
     patch->binding_index = (size_t)binding_index;
+
     patch->metadata.instruction = instruction;
     patch->metadata.address = address;
     patch->metadata.binding_index = (uint32_t)binding_index;
@@ -1454,6 +1552,11 @@ static void runtime_signal_handler(int signal_number, siginfo_t *information,
         } else if (signal_number == SIGILL) {
             handled = patch_caught_syscall(
                 patcher, (uint32_t)(uintptr_t)information->si_addr, context);
+            if (!handled && (uint32_t)(uintptr_t)information->si_addr >= 4u) {
+                handled = patch_caught_syscall(
+                    patcher, (uint32_t)(uintptr_t)information->si_addr - 4u,
+                    context);
+            }
         } else if (signal_number == SIGSEGV) {
             handled = patch_faulting_peripheral(patcher, information, context);
             if (!handled) {
@@ -1464,6 +1567,30 @@ static void runtime_signal_handler(int signal_number, siginfo_t *information,
                 handled = make_heap_page_executable(information, context);
             }
         }
+    }
+    if (!handled && signal_number == SIGILL) {
+        uintptr_t a = (uintptr_t)information->si_addr;
+        uint32_t insn = *(const volatile uint32_t *)a;
+        /* QEMU user mode has no CP15 cache to maintain (and no coprocessor
+         * traps), so an mcr/mrc p15 traps as SIGILL.  The guest's cache
+         * ritual is a no-op here: skip the instruction. */
+        if ((insn & 0x0f000000u) == 0x0e000000u &&
+            (insn & 0x00000f00u) == 0x00000f00u) {
+            PS_LOG_DEBUG("runtime", "skipped CP15 op 0x%08x at 0x%08lx",
+                         insn, (unsigned long)a);
+            context->uc_mcontext.arm_pc = a + 4u;
+            return;
+        }
+    }
+    if (!handled && signal_number == SIGILL) {
+        uintptr_t a = (uintptr_t)information->si_addr;
+        PS_LOG_WARN("runtime", "SIGILL at 0x%08lx thumb=%d words=%08x %08x %08x %08x",
+                    (unsigned long)a,
+                    (context->uc_mcontext.arm_cpsr & (1u << 5)) ? 1 : 0,
+                    *(const volatile uint32_t *)a,
+                    *(const volatile uint32_t *)(a + 4),
+                    *(const volatile uint32_t *)(a - 4),
+                    *(const volatile uint32_t *)(a - 8));
     }
     if (handled) {
         return;
@@ -1530,6 +1657,7 @@ int runtime_patcher_static_patch_syscalls(runtime_patcher_t *patcher) {
             patch->source = cursor;
             patch->original = instruction;
             patch->binding_index = (size_t)binding_index;
+
             if (emit_syscall_trampoline(patcher, patch, trampoline) != 0) {
                 ++failed;
                 continue;

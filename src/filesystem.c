@@ -1088,6 +1088,59 @@ enum sys_seek_whence_e {
 
 
 
+
+/* ---- stream registry ---------------------------------------------------
+ * QEMU user mode aborts the whole process ("glibc detected an invalid stdio
+ * handle") the moment a stream that is not a live FILE* reaches glibc, and
+ * that takes the emulator down with it.  Every stream this shim hands out is
+ * recorded here, so a stale or bogus pointer is caught and reported instead.
+ */
+#define PS_STREAM_MAX 128
+static FILE *ps_streams[PS_STREAM_MAX];
+
+static void ps_stream_add(FILE *fp) {
+    int i;
+    if (!fp) return;
+    for (i = 0; i < PS_STREAM_MAX; ++i) {
+        if (!ps_streams[i]) { ps_streams[i] = fp; return; }
+    }
+}
+
+static void ps_stream_del(FILE *fp) {
+    int i;
+    for (i = 0; i < PS_STREAM_MAX; ++i) {
+        if (ps_streams[i] == fp) { ps_streams[i] = NULL; return; }
+    }
+}
+
+static int ps_stream_ok(const char *who, const void *fp) {
+    int i;
+    if (!fp) return 0;
+    for (i = 0; i < PS_STREAM_MAX; ++i) {
+        if (ps_streams[i] == (FILE *)fp) return 1;
+    }
+    PS_LOG_ERROR("fs", "%s: stream %p is not open here", who, fp);
+    return 0;
+}
+
+/* Diagnostics that are only worth their log volume while something is being
+ * brought up.  The values are read once, so the check costs nothing in a hot
+ * fopen/fwrite path.
+ *
+ *   PRIMESHIM_TRACE_FILES=1     log every guest path the firmware opens
+ *   PRIMESHIM_ECHO_GUEST_LOG=1  echo printable guest file writes (the launcher
+ *                               and image logs) into the shim log
+ */
+static int ps_flag(const char *name) {
+    static int files = -1, echo = -1;
+    int *slot = strcmp(name, "PRIMESHIM_TRACE_FILES") == 0 ? &files : &echo;
+    if (*slot < 0) {
+        const char *v = getenv(name);
+        *slot = (v && *v && !(v[0] == '0' || v[0] == 'n' || v[0] == 'N'));
+    }
+    return *slot;
+}
+
 FILE *SDKLIB__afopen(const char *pathname, const char *mode) {
     PS_LOG_DEBUG("fs", "afopen %s", pathname ? pathname : "<null>");
 
@@ -1107,6 +1160,7 @@ FILE *SDKLIB__afopen(const char *pathname, const char *mode) {
     // We cast the standard FILE* to our opaque FILE*
 
     PS_LOG_DEBUG("fs", "afopen %s -> %p", pathname ? pathname : "<null>", (void *)fp);
+    ps_stream_add(fp);
     return (FILE *)fp;
 }
 
@@ -1124,6 +1178,10 @@ FILE *SDKLIB___wfopen(const UTF16 *pathname, const UTF16 *mode) {
     FILE *fd = SDKLIB__afopen(utf8_path, utf8_mode);
     PS_LOG_TRACE("filesystem", "wfopen path=%s mode=%s result=%p", utf8_path,
                  utf8_mode, (void *)fd);
+    if (ps_flag("PRIMESHIM_TRACE_FILES")) {
+        PS_LOG_INFO("filesystem", "open path=%s mode=%s ok=%d", utf8_path,
+                    utf8_mode, fd != NULL);
+    }
     free(utf8_path);
     free(utf8_mode);
 
@@ -1131,6 +1189,7 @@ FILE *SDKLIB___wfopen(const UTF16 *pathname, const UTF16 *mode) {
 }
 
 size_t SDKLIB__fread(void *ptr, size_t size, size_t nmemb, FILE *stream) {
+    if (!ps_stream_ok("fread", stream)) return 0;
     PS_LOG_DEBUG("fs", "fread stream=%p size=%u nmemb=%u", (void*)stream, (unsigned)size, (unsigned)nmemb);
 
     // Cast our opaque pointer back to the underlying FILE*
@@ -1140,14 +1199,32 @@ size_t SDKLIB__fread(void *ptr, size_t size, size_t nmemb, FILE *stream) {
 }
 
 size_t SDKLIB__fwrite(const void *ptr, size_t size, size_t nmemb, FILE *stream) {
+    if (!ps_stream_ok("fwrite", stream)) return 0;
     PS_LOG_TRACE("filesystem", "fwrite source=%p bytes=%zu", ptr,
                  size * nmemb);
+    if (ptr && size && nmemb && size * nmemb < 8192 &&
+        ps_flag("PRIMESHIM_ECHO_GUEST_LOG")) {
+        const unsigned char *b = (const unsigned char *)ptr;
+        size_t n = size * nmemb, i, printable = 0;
+        for (i = 0; i < n; ++i) {
+            if (b[i] == '\n' || b[i] == '\r' || b[i] == '\t' ||
+                (b[i] >= 0x20 && b[i] < 0x7f)) ++printable;
+        }
+        if (printable * 10 >= n * 9) {
+            char text[512];
+            size_t k = n < sizeof(text) - 1 ? n : sizeof(text) - 1;
+            memcpy(text, b, k);
+            text[k] = 0;
+            PS_LOG_INFO("guestlog", "%s", text);
+        }
+    }
     size_t result = fwrite(ptr, size, nmemb, (FILE *)stream);
 
     return result;
 }
 
 int SDKLIB___fseek(FILE *stream, long offset, int whence) {
+    if (!ps_stream_ok("fseek", stream)) return -1;
     int linux_whence;
     switch (whence) {
         case _SYS_SEEK_SET:
@@ -1178,12 +1255,15 @@ int __fflush(FILE *stream) {
 }
 
 int SDKLIB__fclose(FILE *stream) {
+    if (!ps_stream_ok("fclose", stream)) return -1;
+    ps_stream_del(stream);
     int result = fclose((FILE *)stream);
     return result;
 }
 //------------------------------------loader rel----
 size_t SDKLIB__filesize(FILE *file) {
 
+    if (!ps_stream_ok("filesize", file)) return (size_t)-1;
     if (file == NULL) {
         errno = EINVAL; // Invalid argument
         return (size_t)-1;
